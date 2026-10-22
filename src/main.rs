@@ -17,6 +17,34 @@ struct ErrorMessage {
     message: String,
 }
 
+enum AppError {
+    NotFound(String, i32),
+    Validation(String),
+    Database(sqlx::Error),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            AppError::NotFound(entity, id) => { (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorMessage{error: String::from("not_found"), message: format!("Couldn't find {entity} with id: {id}")})
+                ).into_response()
+            }
+            AppError::Validation(error) => { (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorMessage{error: String::from("validation_failed"), message: String::from(error)})
+                ).into_response()
+            }
+            AppError::Database(_) => { (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorMessage{error: String::from("internal_server_error"), message: String::from("Something failed")})
+                ).into_response()
+            }
+        }
+    }
+}
+
 struct AppState {
     pool: sqlx::PgPool,
 }
@@ -50,17 +78,17 @@ async fn health_check() -> Json<HealthResponse> {
     })
 }
 
-async fn get_tasks(State(app_state): State<Arc<AppState>>) -> Result<Json<Vec<Task>>, StatusCode> {
+async fn get_tasks(State(app_state): State<Arc<AppState>>) -> Result<impl IntoResponse, AppError> {
     let query = sqlx::query_as::<_, Task>("SELECT id, title, completed FROM tasks;");
     let tasks = query.fetch_all(&app_state.pool).await;
 
     match tasks {
         Ok(tasks) => Ok(Json(tasks)),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Err(error) => Err(AppError::Database(error)),
     }
 }
 
-async fn get_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>) -> Result<Json<Task>, StatusCode> {
+async fn get_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>) -> Result<impl IntoResponse, AppError> {
     let query = sqlx::query_as::<_, Task>("SELECT id, title, completed FROM tasks WHERE id = $1;")
         .bind(id);
 
@@ -68,12 +96,12 @@ async fn get_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>) -
 
     match task_result {
         Ok(Some(task)) => Ok(Json(task)),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(None) => Err(AppError::NotFound(String::from("Task"), id)),
+        Err(error) => Err(AppError::Database(error)),
     }
 }
 
-async fn create_task(State(app_state): State<Arc<AppState>>, Json(create_task): Json<CreateTask>) -> Result<impl IntoResponse, (StatusCode, Json<ErrorMessage>)> {
+async fn create_task(State(app_state): State<Arc<AppState>>, Json(create_task): Json<CreateTask>) -> Result<impl IntoResponse, AppError> {
     validate_create_task(&create_task)?;
 
     let query = sqlx::query_as::<_, Task>(
@@ -89,11 +117,11 @@ async fn create_task(State(app_state): State<Arc<AppState>>, Json(create_task): 
 
             Ok((StatusCode::CREATED, headers, Json(task)))
         }
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorMessage{error: String::from("internal_server_error"), message: String::from("Insert failed")}))),
+        Err(error) => Err(AppError::Database(error))
     }
 }
 
-async fn update_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>, Json(add_task): Json<CreateTask>) -> Result<StatusCode, (StatusCode, Json<ErrorMessage>)> {
+async fn update_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>, Json(add_task): Json<CreateTask>) -> Result<impl IntoResponse, AppError> {
     validate_create_task(&add_task)?;
 
     let query = sqlx::query_as::<_, Task>(
@@ -104,19 +132,19 @@ async fn update_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>
 
     match task_result {
         Ok(Some(_)) => Ok(StatusCode::OK),
-        Ok(None) => Err((StatusCode::NOT_FOUND, Json(ErrorMessage{ error: String::from("not_found"), message: format!("Couldn't find Task with id: {id}")}))),
-        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorMessage{error: String::from("internal_server_error"), message: format!("Update failed")}))),
+        Ok(None) => Err(AppError::NotFound(String::from("Task"), id)),
+        Err(error) => Err(AppError::Database(error)),
     }
 }
 
-fn validate_create_task(task: &CreateTask) -> Result<(), (StatusCode, Json<ErrorMessage>)> {
+fn validate_create_task(task: &CreateTask) -> Result<(), AppError> {
     if let Err(error) = task.validate() {
-        return Err((StatusCode::BAD_REQUEST, Json(ErrorMessage { error: String::from("validation_failed"), message: error.to_string() })));
+        return Err(AppError::Validation(error.to_string()));
     }
     Ok(())
 }
 
-async fn delete_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>) -> Result<StatusCode, StatusCode> {
+async fn delete_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>) -> Result<impl IntoResponse, AppError> {
     let result = sqlx::query(
         "DELETE FROM tasks WHERE id = $1;"
     ).bind(&id).execute(&app_state.pool).await;
@@ -127,11 +155,11 @@ async fn delete_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>
                 Ok(StatusCode::NO_CONTENT)
             }
             else {
-                Err(StatusCode::NOT_FOUND)
+                Err(AppError::NotFound(String::from("Task"), id))
             }
         }
-        Err(_) => {
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Err(error) => {
+            Err(AppError::Database(error))
         },
     }
 }
