@@ -26,17 +26,23 @@ enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            AppError::NotFound(entity, id) => { (
+            AppError::NotFound(entity, id) => { 
+                tracing::info!(name: "NotFound", "Can't find {} with id {}", entity, id);
+                (
                     StatusCode::NOT_FOUND,
                     Json(ErrorMessage{error: String::from("not_found"), message: format!("Couldn't find {entity} with id: {id}")})
                 ).into_response()
             }
-            AppError::Validation(error) => { (
+            AppError::Validation(error) => {
+                tracing::info!(name: "Validation", "Validation failed: {}", error);
+                (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorMessage{error: String::from("validation_failed"), message: String::from(error)})
                 ).into_response()
             }
-            AppError::Database(_) => { (
+            AppError::Database(error) => {
+                tracing::error!(error = %error, "Database operation failed");
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorMessage{error: String::from("internal_server_error"), message: String::from("Something failed")})
                 ).into_response()
@@ -169,6 +175,12 @@ async fn delete_task(State(app_state): State<Arc<AppState>>, Path(id): Path<i32>
 async fn main() {
     dotenvy::dotenv().ok();
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+        )
+        .init();
+
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL must be set");
 
@@ -176,14 +188,14 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    println!("Connected to PostgreSQL!");
+    tracing::info!(name: "PostgreSQL Conenction", "Connected to PostgreSQL");
 
     sqlx::migrate!()
         .run(&pool)
         .await
         .expect("Failed to run database migrations");
 
-    println!("Database migrations applied!");
+    tracing::info!(name: "migrations", "Database migrations finished");
 
     let app_state = Arc::new(AppState{pool});
 
@@ -193,11 +205,12 @@ async fn main() {
         .route("/tasks/{id}", get(get_task).put(update_task).delete(delete_task))
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let addr = "127.0.0.1:3000";
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("Failed to bind to address");
 
-    println!("Listening on http://127.0.0.1:3000");
+    tracing::info!(name: "Ready", "Listening on {}", addr);
 
     axum::serve(listener, app)
         .await
